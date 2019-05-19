@@ -68,8 +68,22 @@ typedef struct {
 extern void io_init(void);
 
 
+#ifndef TUKLIB_DOSLIKE
+/// \brief      Write a byte to user_abort_pipe[1]
+///
+/// This is called from a signal handler.
+extern void io_write_to_user_abort_pipe(void);
+#endif
+
+
 /// \brief      Disable creation of sparse files when decompressing
 extern void io_no_sparse(void);
+
+
+#ifdef ENABLE_SANDBOX
+/// \brief      main() calls this if conditions for sandboxing have been met.
+extern void io_allow_sandbox(void);
+#endif
 
 
 /// \brief      Open the source file

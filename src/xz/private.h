@@ -13,7 +13,6 @@
 #include "sysdefs.h"
 #include "mythread.h"
 
-#define LZMA_UNSTABLE
 #include "lzma.h"
 
 #include <sys/types.h>
@@ -46,7 +45,12 @@
 #	define STDERR_FILENO (fileno(stderr))
 #endif
 
+#ifdef HAVE_CAPSICUM
+#	define ENABLE_SANDBOX 1
+#endif
+
 #include "main.h"
+#include "mytime.h"
 #include "coder.h"
 #include "message.h"
 #include "args.h"
@@ -56,4 +60,7 @@
 #include "signals.h"
 #include "suffix.h"
 #include "util.h"
-#include "list.h"
+
+#ifdef HAVE_DECODERS
+#	include "list.h"
+#endif

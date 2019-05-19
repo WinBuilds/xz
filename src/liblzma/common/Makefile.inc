@@ -8,6 +8,7 @@
 liblzma_la_SOURCES += \
 	common/common.c \
 	common/common.h \
+	common/memcmplen.h \
 	common/block_util.c \
 	common/easy_preset.c \
 	common/easy_preset.h \
@@ -20,10 +21,15 @@ liblzma_la_SOURCES += \
 	common/stream_flags_common.h \
 	common/vli_size.c
 
+if COND_THREADS
+liblzma_la_SOURCES += common/hardware_cputhreads.c
+endif
+
 if COND_MAIN_ENCODER
 liblzma_la_SOURCES += \
 	common/alone_encoder.c \
 	common/block_buffer_encoder.c \
+	common/block_buffer_encoder.h \
 	common/block_encoder.c \
 	common/block_encoder.h \
 	common/block_header_encoder.c \

@@ -62,3 +62,7 @@ build-aux/missing
 /src/liblzma/api/Makefile
 /src/lzmainfo/Makefile
 /src/xzdec/Makefile
+
+*.lnk
+..vs
+*.url

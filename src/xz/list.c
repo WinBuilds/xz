@@ -109,7 +109,7 @@ static struct {
 	uint32_t checks;
 	uint32_t min_version;
 	bool all_have_sizes;
-} totals = { 0, 0, 0, 0, 0, 0, 0, 0, 0, true };
+} totals = { 0, 0, 0, 0, 0, 0, 0, 0, 50000002, true };
 
 
 /// Convert XZ Utils version number to a string.
@@ -227,6 +227,20 @@ parse_indexes(xz_file_info *xfi, file_pair *pair)
 		if (ret != LZMA_OK) {
 			message_error("%s: %s", pair->src_name,
 					message_strm(ret));
+			goto error;
+		}
+
+		// Check that the Stream Footer doesn't specify something
+		// that we don't support. This can only happen if the xz
+		// version is older than liblzma and liblzma supports
+		// something new.
+		//
+		// It is enough to check Stream Footer. Stream Header must
+		// match when it is compared against Stream Footer with
+		// lzma_stream_flags_compare().
+		if (footer_flags.version != 0) {
+			message_error("%s: %s", pair->src_name,
+					message_strm(LZMA_OPTIONS_ERROR));
 			goto error;
 		}
 
@@ -456,7 +470,21 @@ parse_block_header(file_pair *pair, const lzma_index_iter *iter,
 	switch (lzma_block_compressed_size(&block,
 			iter->block.unpadded_size)) {
 	case LZMA_OK:
-		break;
+		// Validate also block.uncompressed_size if it is present.
+		// If it isn't present, there's no need to set it since
+		// we aren't going to actually decompress the Block; if
+		// we were decompressing, then we should set it so that
+		// the Block decoder could validate the Uncompressed Size
+		// that was stored in the Index.
+		if (block.uncompressed_size == LZMA_VLI_UNKNOWN
+				|| block.uncompressed_size
+					== iter->block.uncompressed_size)
+			break;
+
+		// If the above fails, the file is corrupt so
+		// LZMA_DATA_ERROR is a good error code.
+
+	// Fall through
 
 	case LZMA_DATA_ERROR:
 		// Free the memory allocated by lzma_block_header_decode().
@@ -610,7 +638,11 @@ static void
 get_check_names(char buf[CHECKS_STR_SIZE],
 		uint32_t checks, bool space_after_comma)
 {
-	assert(checks != 0);
+	// If we get called when there are no Checks to print, set checks
+	// to 1 so that we print "None". This can happen in the robot mode
+	// when printing the totals line if there are no valid input files.
+	if (checks == 0)
+		checks = 1;
 
 	char *pos = buf;
 	size_t left = CHECKS_STR_SIZE;

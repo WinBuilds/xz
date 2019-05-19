@@ -53,6 +53,27 @@ lzma_alloc(size_t size, const lzma_allocator *allocator)
 }
 
 
+extern void * lzma_attribute((__malloc__)) lzma_attr_alloc_size(1)
+lzma_alloc_zero(size_t size, const lzma_allocator *allocator)
+{
+	// Some calloc() variants return NULL if called with size == 0.
+	if (size == 0)
+		size = 1;
+
+	void *ptr;
+
+	if (allocator != NULL && allocator->alloc != NULL) {
+		ptr = allocator->alloc(allocator->opaque, 1, size);
+		if (ptr != NULL)
+			memzero(ptr, size);
+	} else {
+		ptr = calloc(1, size);
+	}
+
+	return ptr;
+}
+
+
 extern void
 lzma_free(void *ptr, const lzma_allocator *allocator)
 {
@@ -176,7 +197,7 @@ lzma_code(lzma_stream *strm, lzma_action action)
 			|| (strm->next_out == NULL && strm->avail_out != 0)
 			|| strm->internal == NULL
 			|| strm->internal->next.code == NULL
-			|| (unsigned int)(action) > LZMA_FINISH
+			|| (unsigned int)(action) > LZMA_ACTION_MAX
 			|| !strm->internal->supported_actions[action])
 		return LZMA_PROG_ERROR;
 
@@ -211,6 +232,10 @@ lzma_code(lzma_stream *strm, lzma_action action)
 		case LZMA_FINISH:
 			strm->internal->sequence = ISEQ_FINISH;
 			break;
+
+		case LZMA_FULL_BARRIER:
+			strm->internal->sequence = ISEQ_FULL_BARRIER;
+			break;
 		}
 
 		break;
@@ -233,6 +258,13 @@ lzma_code(lzma_stream *strm, lzma_action action)
 
 	case ISEQ_FINISH:
 		if (action != LZMA_FINISH
+				|| strm->internal->avail_in != strm->avail_in)
+			return LZMA_PROG_ERROR;
+
+		break;
+
+	case ISEQ_FULL_BARRIER:
+		if (action != LZMA_FULL_BARRIER
 				|| strm->internal->avail_in != strm->avail_in)
 			return LZMA_PROG_ERROR;
 
@@ -288,7 +320,9 @@ lzma_code(lzma_stream *strm, lzma_action action)
 
 	case LZMA_STREAM_END:
 		if (strm->internal->sequence == ISEQ_SYNC_FLUSH
-				|| strm->internal->sequence == ISEQ_FULL_FLUSH)
+				|| strm->internal->sequence == ISEQ_FULL_FLUSH
+				|| strm->internal->sequence
+					== ISEQ_FULL_BARRIER)
 			strm->internal->sequence = ISEQ_RUN;
 		else
 			strm->internal->sequence = ISEQ_END;
@@ -401,8 +435,10 @@ lzma_memlimit_set(lzma_stream *strm, uint64_t new_memlimit)
 			|| strm->internal->next.memconfig == NULL)
 		return LZMA_PROG_ERROR;
 
-	if (new_memlimit != 0 && new_memlimit < LZMA_MEMUSAGE_BASE)
-		return LZMA_MEMLIMIT_ERROR;
+	// Zero is a special value that cannot be used as an actual limit.
+	// If 0 was specified, use 1 instead.
+	if (new_memlimit == 0)
+		new_memlimit = 1;
 
 	return strm->internal->next.memconfig(strm->internal->next.coder,
 			&memusage, &old_memlimit, new_memlimit);

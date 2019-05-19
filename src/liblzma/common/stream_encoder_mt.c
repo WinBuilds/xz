@@ -13,6 +13,7 @@
 #include "filter_encoder.h"
 #include "easy_preset.h"
 #include "block_encoder.h"
+#include "block_buffer_encoder.h"
 #include "index_encoder.h"
 #include "outqueue.h"
 
@@ -43,6 +44,7 @@ typedef enum {
 
 } worker_state;
 
+typedef struct lzma_stream_coder_s lzma_stream_coder;
 
 typedef struct worker_thread_s worker_thread;
 struct worker_thread_s {
@@ -64,7 +66,7 @@ struct worker_thread_s {
 
 	/// Pointer to the main structure is needed when putting this
 	/// thread back to the stack of free threads.
-	lzma_coder *coder;
+	lzma_stream_coder *coder;
 
 	/// The allocator is set by the main thread. Since a copy of the
 	/// pointer is kept here, the application must not change the
@@ -86,16 +88,16 @@ struct worker_thread_s {
 	/// Next structure in the stack of free worker threads.
 	worker_thread *next;
 
-	pthread_mutex_t mutex;
-	pthread_cond_t cond;
+	mythread_mutex mutex;
+	mythread_cond cond;
 
 	/// The ID of this thread is used to join the thread
 	/// when it's not needed anymore.
-	pthread_t thread_id;
+	mythread thread_id;
 };
 
 
-struct lzma_coder_s {
+struct lzma_stream_coder_s {
 	enum {
 		SEQ_STREAM_HEADER,
 		SEQ_BLOCK,
@@ -132,12 +134,9 @@ struct lzma_coder_s {
 	lzma_outq outq;
 
 
-	/// True if wait_max is used.
-	bool has_timeout;
-
 	/// Maximum wait time if cannot use all the input and cannot
-	/// fill the output buffer.
-	struct timespec wait_max;
+	/// fill the output buffer. This is in milliseconds.
+	uint32_t timeout;
 
 
 	/// Error code from a worker thread
@@ -173,7 +172,7 @@ struct lzma_coder_s {
 	uint64_t progress_out;
 
 
-	pthread_mutex_t mutex;
+	mythread_mutex mutex;
 	mythread_cond cond;
 };
 
@@ -252,7 +251,7 @@ worker_encode(worker_thread *thr, worker_state state)
 
 			while (in_size == thr->in_size
 					&& thr->state == THR_RUN)
-				pthread_cond_wait(&thr->cond, &thr->mutex);
+				mythread_cond_wait(&thr->cond, &thr->mutex);
 
 			state = thr->state;
 			in_size = thr->in_size;
@@ -279,19 +278,55 @@ worker_encode(worker_thread *thr, worker_state state)
 				thr->block_encoder.coder, thr->allocator,
 				thr->in, &in_pos, in_limit, thr->outbuf->buf,
 				&thr->outbuf->size, out_size, action);
-	} while (ret == LZMA_OK);
+	} while (ret == LZMA_OK && thr->outbuf->size < out_size);
 
-	if (ret != LZMA_STREAM_END) {
-		worker_error(thr, ret);
-		return THR_STOP;
-	}
+	switch (ret) {
+	case LZMA_STREAM_END:
+		assert(state == THR_FINISH);
 
-	assert(state == THR_FINISH);
+		// Encode the Block Header. By doing it after
+		// the compression, we can store the Compressed Size
+		// and Uncompressed Size fields.
+		ret = lzma_block_header_encode(&thr->block_options,
+				thr->outbuf->buf);
+		if (ret != LZMA_OK) {
+			worker_error(thr, ret);
+			return THR_STOP;
+		}
 
-	// Encode the Block Header. By doing it after the compression,
-	// we can store the Compressed Size and Uncompressed Size fields.
-	ret = lzma_block_header_encode(&thr->block_options, thr->outbuf->buf);
-	if (ret != LZMA_OK) {
+		break;
+
+	case LZMA_OK:
+		// The data was incompressible. Encode it using uncompressed
+		// LZMA2 chunks.
+		//
+		// First wait that we have gotten all the input.
+		mythread_sync(thr->mutex) {
+			while (thr->state == THR_RUN)
+				mythread_cond_wait(&thr->cond, &thr->mutex);
+
+			state = thr->state;
+			in_size = thr->in_size;
+		}
+
+		if (state >= THR_STOP)
+			return state;
+
+		// Do the encoding. This takes care of the Block Header too.
+		thr->outbuf->size = 0;
+		ret = lzma_block_uncomp_encode(&thr->block_options,
+				thr->in, in_size, thr->outbuf->buf,
+				&thr->outbuf->size, out_size);
+
+		// It shouldn't fail.
+		if (ret != LZMA_OK) {
+			worker_error(thr, LZMA_PROG_ERROR);
+			return THR_STOP;
+		}
+
+		break;
+
+	default:
 		worker_error(thr, ret);
 		return THR_STOP;
 	}
@@ -307,7 +342,7 @@ worker_encode(worker_thread *thr, worker_state state)
 }
 
 
-static void *
+static MYTHREAD_RET_TYPE
 worker_start(void *thr_ptr)
 {
 	worker_thread *thr = thr_ptr;
@@ -321,14 +356,14 @@ worker_start(void *thr_ptr)
 				// requested to stop, just set the state.
 				if (thr->state == THR_STOP) {
 					thr->state = THR_IDLE;
-					pthread_cond_signal(&thr->cond);
+					mythread_cond_signal(&thr->cond);
 				}
 
 				state = thr->state;
 				if (state != THR_IDLE)
 					break;
 
-				pthread_cond_wait(&thr->cond, &thr->mutex);
+				mythread_cond_wait(&thr->cond, &thr->mutex);
 			}
 		}
 
@@ -341,11 +376,14 @@ worker_start(void *thr_ptr)
 		if (state == THR_EXIT)
 			break;
 
-		// Mark the thread as idle. Signal is needed for the case
+		// Mark the thread as idle unless the main thread has
+		// told us to exit. Signal is needed for the case
 		// where the main thread is waiting for the threads to stop.
 		mythread_sync(thr->mutex) {
-			thr->state = THR_IDLE;
-			pthread_cond_signal(&thr->cond);
+			if (thr->state != THR_EXIT) {
+				thr->state = THR_IDLE;
+				mythread_cond_signal(&thr->cond);
+			}
 		}
 
 		mythread_sync(thr->coder->mutex) {
@@ -369,35 +407,35 @@ worker_start(void *thr_ptr)
 	}
 
 	// Exiting, free the resources.
-	pthread_mutex_destroy(&thr->mutex);
-	pthread_cond_destroy(&thr->cond);
+	mythread_mutex_destroy(&thr->mutex);
+	mythread_cond_destroy(&thr->cond);
 
 	lzma_next_end(&thr->block_encoder, thr->allocator);
 	lzma_free(thr->in, thr->allocator);
-	return NULL;
+	return MYTHREAD_RET_VALUE;
 }
 
 
 /// Make the threads stop but not exit. Optionally wait for them to stop.
 static void
-threads_stop(lzma_coder *coder, bool wait)
+threads_stop(lzma_stream_coder *coder, bool wait_for_threads)
 {
 	// Tell the threads to stop.
 	for (uint32_t i = 0; i < coder->threads_initialized; ++i) {
 		mythread_sync(coder->threads[i].mutex) {
 			coder->threads[i].state = THR_STOP;
-			pthread_cond_signal(&coder->threads[i].cond);
+			mythread_cond_signal(&coder->threads[i].cond);
 		}
 	}
 
-	if (!wait)
+	if (!wait_for_threads)
 		return;
 
 	// Wait for the threads to settle in the idle state.
 	for (uint32_t i = 0; i < coder->threads_initialized; ++i) {
 		mythread_sync(coder->threads[i].mutex) {
 			while (coder->threads[i].state != THR_IDLE)
-				pthread_cond_wait(&coder->threads[i].cond,
+				mythread_cond_wait(&coder->threads[i].cond,
 						&coder->threads[i].mutex);
 		}
 	}
@@ -409,17 +447,17 @@ threads_stop(lzma_coder *coder, bool wait)
 /// Stop the threads and free the resources associated with them.
 /// Wait until the threads have exited.
 static void
-threads_end(lzma_coder *coder, const lzma_allocator *allocator)
+threads_end(lzma_stream_coder *coder, const lzma_allocator *allocator)
 {
 	for (uint32_t i = 0; i < coder->threads_initialized; ++i) {
 		mythread_sync(coder->threads[i].mutex) {
 			coder->threads[i].state = THR_EXIT;
-			pthread_cond_signal(&coder->threads[i].cond);
+			mythread_cond_signal(&coder->threads[i].cond);
 		}
 	}
 
 	for (uint32_t i = 0; i < coder->threads_initialized; ++i) {
-		int ret = pthread_join(coder->threads[i].thread_id, NULL);
+		int ret = mythread_join(coder->threads[i].thread_id);
 		assert(ret == 0);
 		(void)ret;
 	}
@@ -431,7 +469,8 @@ threads_end(lzma_coder *coder, const lzma_allocator *allocator)
 
 /// Initialize a new worker_thread structure and create a new thread.
 static lzma_ret
-initialize_new_thread(lzma_coder *coder, const lzma_allocator *allocator)
+initialize_new_thread(lzma_stream_coder *coder,
+		const lzma_allocator *allocator)
 {
 	worker_thread *thr = &coder->threads[coder->threads_initialized];
 
@@ -439,10 +478,10 @@ initialize_new_thread(lzma_coder *coder, const lzma_allocator *allocator)
 	if (thr->in == NULL)
 		return LZMA_MEM_ERROR;
 
-	if (pthread_mutex_init(&thr->mutex, NULL))
+	if (mythread_mutex_init(&thr->mutex))
 		goto error_mutex;
 
-	if (pthread_cond_init(&thr->cond, NULL))
+	if (mythread_cond_init(&thr->cond))
 		goto error_cond;
 
 	thr->state = THR_IDLE;
@@ -461,10 +500,10 @@ initialize_new_thread(lzma_coder *coder, const lzma_allocator *allocator)
 	return LZMA_OK;
 
 error_thread:
-	pthread_cond_destroy(&thr->cond);
+	mythread_cond_destroy(&thr->cond);
 
 error_cond:
-	pthread_mutex_destroy(&thr->mutex);
+	mythread_mutex_destroy(&thr->mutex);
 
 error_mutex:
 	lzma_free(thr->in, allocator);
@@ -473,7 +512,7 @@ error_mutex:
 
 
 static lzma_ret
-get_thread(lzma_coder *coder, const lzma_allocator *allocator)
+get_thread(lzma_stream_coder *coder, const lzma_allocator *allocator)
 {
 	// If there are no free output subqueues, there is no
 	// point to try getting a thread.
@@ -503,7 +542,7 @@ get_thread(lzma_coder *coder, const lzma_allocator *allocator)
 		coder->thr->state = THR_RUN;
 		coder->thr->in_size = 0;
 		coder->thr->outbuf = lzma_outq_get_buf(&coder->outq);
-		pthread_cond_signal(&coder->thr->cond);
+		mythread_cond_signal(&coder->thr->cond);
 	}
 
 	return LZMA_OK;
@@ -511,7 +550,7 @@ get_thread(lzma_coder *coder, const lzma_allocator *allocator)
 
 
 static lzma_ret
-stream_encode_in(lzma_coder *coder, const lzma_allocator *allocator,
+stream_encode_in(lzma_stream_coder *coder, const lzma_allocator *allocator,
 		const uint8_t *restrict in, size_t *restrict in_pos,
 		size_t in_size, lzma_action action)
 {
@@ -554,7 +593,7 @@ stream_encode_in(lzma_coder *coder, const lzma_allocator *allocator,
 				if (finish)
 					coder->thr->state = THR_FINISH;
 
-				pthread_cond_signal(&coder->thr->cond);
+				mythread_cond_signal(&coder->thr->cond);
 			}
 		}
 
@@ -579,21 +618,20 @@ stream_encode_in(lzma_coder *coder, const lzma_allocator *allocator,
 /// Wait until more input can be consumed, more output can be read, or
 /// an optional timeout is reached.
 static bool
-wait_for_work(lzma_coder *coder, struct timespec *wait_abs,
+wait_for_work(lzma_stream_coder *coder, mythread_condtime *wait_abs,
 		bool *has_blocked, bool has_input)
 {
-	if (coder->has_timeout && !*has_blocked) {
+	if (coder->timeout != 0 && !*has_blocked) {
 		// Every time when stream_encode_mt() is called via
-		// lzma_code(), *has_block starts as false. We set it
+		// lzma_code(), *has_blocked starts as false. We set it
 		// to true here and calculate the absolute time when
 		// we must return if there's nothing to do.
 		//
 		// The idea of *has_blocked is to avoid unneeded calls
-		// to mythread_cond_abstime(), which may do a syscall
+		// to mythread_condtime_set(), which may do a syscall
 		// depending on the operating system.
 		*has_blocked = true;
-		*wait_abs = coder->wait_max;
-		mythread_cond_abstime(&coder->cond, wait_abs);
+		mythread_condtime_set(wait_abs, &coder->cond, coder->timeout);
 	}
 
 	bool timed_out = false;
@@ -611,7 +649,7 @@ wait_for_work(lzma_coder *coder, struct timespec *wait_abs,
 				&& !lzma_outq_is_readable(&coder->outq)
 				&& coder->thread_error == LZMA_OK
 				&& !timed_out) {
-			if (coder->has_timeout)
+			if (coder->timeout != 0)
 				timed_out = mythread_cond_timedwait(
 						&coder->cond, &coder->mutex,
 						wait_abs) != 0;
@@ -626,11 +664,13 @@ wait_for_work(lzma_coder *coder, struct timespec *wait_abs,
 
 
 static lzma_ret
-stream_encode_mt(lzma_coder *coder, const lzma_allocator *allocator,
+stream_encode_mt(void *coder_ptr, const lzma_allocator *allocator,
 		const uint8_t *restrict in, size_t *restrict in_pos,
 		size_t in_size, uint8_t *restrict out,
 		size_t *restrict out_pos, size_t out_size, lzma_action action)
 {
+	lzma_stream_coder *coder = coder_ptr;
+
 	switch (coder->sequence) {
 	case SEQ_STREAM_HEADER:
 		lzma_bufcpy(coder->header, &coder->header_pos,
@@ -652,7 +692,7 @@ stream_encode_mt(lzma_coder *coder, const lzma_allocator *allocator,
 
 		// These are for wait_for_work().
 		bool has_blocked = false;
-		struct timespec wait_abs;
+		mythread_condtime wait_abs;
 
 		while (true) {
 			mythread_sync(coder->mutex) {
@@ -690,13 +730,6 @@ stream_encode_mt(lzma_coder *coder, const lzma_allocator *allocator,
 				return ret;
 			}
 
-			// Check if the last Block was finished.
-			if (action == LZMA_FINISH
-					&& *in_pos == in_size
-					&& lzma_outq_is_empty(
-						&coder->outq))
-				break;
-
 			// Try to give uncompressed data to a worker thread.
 			ret = stream_encode_in(coder, allocator,
 					in, in_pos, in_size, action);
@@ -705,14 +738,44 @@ stream_encode_mt(lzma_coder *coder, const lzma_allocator *allocator,
 				return ret;
 			}
 
-			// Return if
-			//  - we have used all the input and expect to
-			//    get more input; or
-			//  - the output buffer has been filled.
+			// See if we should wait or return.
 			//
-			// TODO: Support flushing.
-			if ((*in_pos == in_size && action != LZMA_FINISH)
-					|| *out_pos == out_size)
+			// TODO: LZMA_SYNC_FLUSH and LZMA_SYNC_BARRIER.
+			if (*in_pos == in_size) {
+				// LZMA_RUN: More data is probably coming
+				// so return to let the caller fill the
+				// input buffer.
+				if (action == LZMA_RUN)
+					return LZMA_OK;
+
+				// LZMA_FULL_BARRIER: The same as with
+				// LZMA_RUN but tell the caller that the
+				// barrier was completed.
+				if (action == LZMA_FULL_BARRIER)
+					return LZMA_STREAM_END;
+
+				// Finishing or flushing isn't completed until
+				// all input data has been encoded and copied
+				// to the output buffer.
+				if (lzma_outq_is_empty(&coder->outq)) {
+					// LZMA_FINISH: Continue to encode
+					// the Index field.
+					if (action == LZMA_FINISH)
+						break;
+
+					// LZMA_FULL_FLUSH: Return to tell
+					// the caller that flushing was
+					// completed.
+					if (action == LZMA_FULL_FLUSH)
+						return LZMA_STREAM_END;
+				}
+			}
+
+			// Return if there is no output space left.
+			// This check must be done after testing the input
+			// buffer, because we might want to use a different
+			// return code.
+			if (*out_pos == out_size)
 				return LZMA_OK;
 
 			// Neither in nor out has been used completely.
@@ -775,8 +838,10 @@ stream_encode_mt(lzma_coder *coder, const lzma_allocator *allocator,
 
 
 static void
-stream_encoder_mt_end(lzma_coder *coder, const lzma_allocator *allocator)
+stream_encoder_mt_end(void *coder_ptr, const lzma_allocator *allocator)
 {
+	lzma_stream_coder *coder = coder_ptr;
+
 	// Threads must be killed before the output queue can be freed.
 	threads_end(coder, allocator);
 	lzma_outq_end(&coder->outq, allocator);
@@ -788,7 +853,7 @@ stream_encoder_mt_end(lzma_coder *coder, const lzma_allocator *allocator)
 	lzma_index_end(coder->index, allocator);
 
 	mythread_cond_destroy(&coder->cond);
-	pthread_mutex_destroy(&coder->mutex);
+	mythread_mutex_destroy(&coder->mutex);
 
 	lzma_free(coder, allocator);
 	return;
@@ -839,22 +904,21 @@ get_options(const lzma_mt *options, lzma_options_easy *opt_easy,
 	// Calculate the maximum amount output that a single output buffer
 	// may need to hold. This is the same as the maximum total size of
 	// a Block.
-	//
-	// FIXME: As long as the encoder keeps the whole input buffer
-	// available and doesn't start writing output before finishing
-	// the Block, it could use lzma_stream_buffer_bound() and use
-	// uncompressed LZMA2 chunks if the data doesn't compress.
-	*outbuf_size_max = *block_size + *block_size / 16 + 16384;
+	*outbuf_size_max = lzma_block_buffer_bound64(*block_size);
+	if (*outbuf_size_max == 0)
+		return LZMA_MEM_ERROR;
 
 	return LZMA_OK;
 }
 
 
 static void
-get_progress(lzma_coder *coder, uint64_t *progress_in, uint64_t *progress_out)
+get_progress(void *coder_ptr, uint64_t *progress_in, uint64_t *progress_out)
 {
+	lzma_stream_coder *coder = coder_ptr;
+
 	// Lock coder->mutex to prevent finishing threads from moving their
-	// progress info from the worker_thread structure to lzma_coder.
+	// progress info from the worker_thread structure to lzma_stream_coder.
 	mythread_sync(coder->mutex) {
 		*progress_in = coder->progress_in;
 		*progress_out = coder->progress_out;
@@ -891,9 +955,12 @@ stream_encoder_mt_init(lzma_next_coder *next, const lzma_allocator *allocator,
 		return LZMA_MEM_ERROR;
 #endif
 
-	// FIXME TODO: Validate the filter chain so that we can give
-	// an error in this function instead of delaying it to the first
-	// call to lzma_code().
+	// Validate the filter chain so that we can give an error in this
+	// function instead of delaying it to the first call to lzma_code().
+	// The memory usage calculation verifies the filter chain as
+	// a side effect so we take advatange of that.
+	if (lzma_raw_encoder_memusage(filters) == UINT64_MAX)
+		return LZMA_OPTIONS_ERROR;
 
 	// Validate the Check ID.
 	if ((unsigned int)(options->check) > LZMA_CHECK_ID_MAX)
@@ -903,24 +970,27 @@ stream_encoder_mt_init(lzma_next_coder *next, const lzma_allocator *allocator,
 		return LZMA_UNSUPPORTED_CHECK;
 
 	// Allocate and initialize the base structure if needed.
-	if (next->coder == NULL) {
-		next->coder = lzma_alloc(sizeof(lzma_coder), allocator);
-		if (next->coder == NULL)
+	lzma_stream_coder *coder = next->coder;
+	if (coder == NULL) {
+		coder = lzma_alloc(sizeof(lzma_stream_coder), allocator);
+		if (coder == NULL)
 			return LZMA_MEM_ERROR;
+
+		next->coder = coder;
 
 		// For the mutex and condition variable initializations
 		// the error handling has to be done here because
 		// stream_encoder_mt_end() doesn't know if they have
 		// already been initialized or not.
-		if (pthread_mutex_init(&next->coder->mutex, NULL)) {
-			lzma_free(next->coder, allocator);
+		if (mythread_mutex_init(&coder->mutex)) {
+			lzma_free(coder, allocator);
 			next->coder = NULL;
 			return LZMA_MEM_ERROR;
 		}
 
-		if (mythread_cond_init(&next->coder->cond)) {
-			pthread_mutex_destroy(&next->coder->mutex);
-			lzma_free(next->coder, allocator);
+		if (mythread_cond_init(&coder->cond)) {
+			mythread_mutex_destroy(&coder->mutex);
+			lzma_free(coder, allocator);
 			next->coder = NULL;
 			return LZMA_MEM_ERROR;
 		}
@@ -930,83 +1000,76 @@ stream_encoder_mt_init(lzma_next_coder *next, const lzma_allocator *allocator,
 		next->get_progress = &get_progress;
 // 		next->update = &stream_encoder_mt_update;
 
-		next->coder->filters[0].id = LZMA_VLI_UNKNOWN;
-		next->coder->index_encoder = LZMA_NEXT_CODER_INIT;
-		next->coder->index = NULL;
-		memzero(&next->coder->outq, sizeof(next->coder->outq));
-		next->coder->threads = NULL;
-		next->coder->threads_max = 0;
-		next->coder->threads_initialized = 0;
+		coder->filters[0].id = LZMA_VLI_UNKNOWN;
+		coder->index_encoder = LZMA_NEXT_CODER_INIT;
+		coder->index = NULL;
+		memzero(&coder->outq, sizeof(coder->outq));
+		coder->threads = NULL;
+		coder->threads_max = 0;
+		coder->threads_initialized = 0;
 	}
 
 	// Basic initializations
-	next->coder->sequence = SEQ_STREAM_HEADER;
-	next->coder->block_size = (size_t)(block_size);
-	next->coder->thread_error = LZMA_OK;
-	next->coder->thr = NULL;
+	coder->sequence = SEQ_STREAM_HEADER;
+	coder->block_size = (size_t)(block_size);
+	coder->thread_error = LZMA_OK;
+	coder->thr = NULL;
 
 	// Allocate the thread-specific base structures.
 	assert(options->threads > 0);
-	if (next->coder->threads_max != options->threads) {
-		threads_end(next->coder, allocator);
+	if (coder->threads_max != options->threads) {
+		threads_end(coder, allocator);
 
-		next->coder->threads = NULL;
-		next->coder->threads_max = 0;
+		coder->threads = NULL;
+		coder->threads_max = 0;
 
-		next->coder->threads_initialized = 0;
-		next->coder->threads_free = NULL;
+		coder->threads_initialized = 0;
+		coder->threads_free = NULL;
 
-		next->coder->threads = lzma_alloc(
+		coder->threads = lzma_alloc(
 				options->threads * sizeof(worker_thread),
 				allocator);
-		if (next->coder->threads == NULL)
+		if (coder->threads == NULL)
 			return LZMA_MEM_ERROR;
 
-		next->coder->threads_max = options->threads;
+		coder->threads_max = options->threads;
 	} else {
 		// Reuse the old structures and threads. Tell the running
 		// threads to stop and wait until they have stopped.
-		threads_stop(next->coder, true);
+		threads_stop(coder, true);
 	}
 
 	// Output queue
-	return_if_error(lzma_outq_init(&next->coder->outq, allocator,
+	return_if_error(lzma_outq_init(&coder->outq, allocator,
 			outbuf_size_max, options->threads));
 
 	// Timeout
-	if (options->timeout > 0) {
-		next->coder->wait_max.tv_sec = options->timeout / 1000;
-		next->coder->wait_max.tv_nsec
-				= (options->timeout % 1000) * 1000000L;
-		next->coder->has_timeout = true;
-	} else {
-		next->coder->has_timeout = false;
-	}
+	coder->timeout = options->timeout;
 
 	// Free the old filter chain and copy the new one.
-	for (size_t i = 0; next->coder->filters[i].id != LZMA_VLI_UNKNOWN; ++i)
-		lzma_free(next->coder->filters[i].options, allocator);
+	for (size_t i = 0; coder->filters[i].id != LZMA_VLI_UNKNOWN; ++i)
+		lzma_free(coder->filters[i].options, allocator);
 
-	return_if_error(lzma_filters_copy(options->filters,
-			next->coder->filters, allocator));
+	return_if_error(lzma_filters_copy(
+			filters, coder->filters, allocator));
 
 	// Index
-	lzma_index_end(next->coder->index, allocator);
-	next->coder->index = lzma_index_init(allocator);
-	if (next->coder->index == NULL)
+	lzma_index_end(coder->index, allocator);
+	coder->index = lzma_index_init(allocator);
+	if (coder->index == NULL)
 		return LZMA_MEM_ERROR;
 
 	// Stream Header
-	next->coder->stream_flags.version = 0;
-	next->coder->stream_flags.check = options->check;
+	coder->stream_flags.version = 0;
+	coder->stream_flags.check = options->check;
 	return_if_error(lzma_stream_header_encode(
-			&next->coder->stream_flags, next->coder->header));
+			&coder->stream_flags, coder->header));
 
-	next->coder->header_pos = 0;
+	coder->header_pos = 0;
 
 	// Progress info
-	next->coder->progress_in = 0;
-	next->coder->progress_out = LZMA_STREAM_HEADER_SIZE;
+	coder->progress_in = 0;
+	coder->progress_out = LZMA_STREAM_HEADER_SIZE;
 
 	return LZMA_OK;
 }
@@ -1019,8 +1082,8 @@ lzma_stream_encoder_mt(lzma_stream *strm, const lzma_mt *options)
 
 	strm->internal->supported_actions[LZMA_RUN] = true;
 // 	strm->internal->supported_actions[LZMA_SYNC_FLUSH] = true;
-// 	strm->internal->supported_actions[LZMA_FULL_FLUSH] = true;
-// 	strm->internal->supported_actions[LZMA_FULL_BARRIER] = true;
+	strm->internal->supported_actions[LZMA_FULL_FLUSH] = true;
+	strm->internal->supported_actions[LZMA_FULL_BARRIER] = true;
 	strm->internal->supported_actions[LZMA_FINISH] = true;
 
 	return LZMA_OK;
@@ -1046,8 +1109,7 @@ lzma_stream_encoder_mt_memusage(const lzma_mt *options)
 	const uint64_t inbuf_memusage = options->threads * block_size;
 
 	// Memory usage of the filter encoders
-	uint64_t filters_memusage
-			= lzma_raw_encoder_memusage(options->filters);
+	uint64_t filters_memusage = lzma_raw_encoder_memusage(filters);
 	if (filters_memusage == UINT64_MAX)
 		return UINT64_MAX;
 
@@ -1060,7 +1122,8 @@ lzma_stream_encoder_mt_memusage(const lzma_mt *options)
 		return UINT64_MAX;
 
 	// Sum them with overflow checking.
-	uint64_t total_memusage = LZMA_MEMUSAGE_BASE + sizeof(lzma_coder)
+	uint64_t total_memusage = LZMA_MEMUSAGE_BASE
+			+ sizeof(lzma_stream_coder)
 			+ options->threads * sizeof(worker_thread);
 
 	if (UINT64_MAX - total_memusage < inbuf_memusage)
